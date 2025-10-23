@@ -9,19 +9,55 @@ from dateparser.search import search_dates
 from datetime import date, datetime, timedelta
 import time
 import asyncio
+import traceback
 
-# --- env & DB -------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# Environment & DB
+# ─────────────────────────────────────────────────────────────
 load_dotenv(override=True)
-DB_URL = os.getenv("DATABASE_URL")
 
-conn = psycopg2.connect(DB_URL, sslmode="require")
-conn.autocommit = True
+# Preferred: set DATABASE_URL in Railway Variables (and locally in .env)
+DB_URL = os.getenv("DATABASE_URL", "").strip()
+# Optional discrete vars if you ever need them (ignored when DB_URL is set)
+DB_HOST = os.getenv("DB_HOST", "").strip()
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+DB_NAME = os.getenv("DB_NAME", "").strip()
+DB_USER = os.getenv("DB_USER", "").strip()
+DB_PASSWORD = os.getenv("DB_PASSWORD", "").strip()
+# Most managed Postgres want SSL. Use "prefer" only if your DB doesn’t support SSL.
+DB_SSLMODE = os.getenv("DB_SSLMODE", "require").strip()
 
-Y_MIN = 2010  # guard against 1969/1970 bugs etc.
+def _connect():
+    """
+    Create a short-lived connection for each query.
+    Keepalives help across NAT/idle; avoids stale global handles on Railway.
+    """
+    keepalive = dict(
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
+    if DB_URL:
+        return psycopg2.connect(DB_URL, sslmode=DB_SSLMODE, **keepalive)
 
-# =========================
-# Progress helpers (single-line, hide after)
-# =========================
+    # Fallback if you don’t have a URL
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        sslmode=DB_SSLMODE,
+        **keepalive,
+    )
+
+Y_MIN = 2010  # guard against accidental 1970-era parsing etc.
+
+# ─────────────────────────────────────────────────────────────
+# Progress helpers (single-line, then hidden)
+# ─────────────────────────────────────────────────────────────
 async def progress_start(text: str = "💭 Thinking …") -> cl.Message:
     m = cl.Message(content=text)
     await m.send()
@@ -31,7 +67,7 @@ async def progress_update(m: cl.Message, text: str) -> None:
     try:
         await m.update(content=text)
     except Exception:
-        pass  # keep one bubble even if update isn't supported
+        pass
 
 async def progress_hide(m: cl.Message) -> None:
     try:
@@ -42,9 +78,9 @@ async def progress_hide(m: cl.Message) -> None:
         except Exception:
             pass
 
-# =========================
-# Disclaimer on chat start
-# =========================
+# ─────────────────────────────────────────────────────────────
+# Disclaimer at chat start
+# ─────────────────────────────────────────────────────────────
 @cl.on_chat_start
 async def chat_start():
     disclaimer = (
@@ -56,9 +92,9 @@ async def chat_start():
     )
     await cl.Message(content=disclaimer).send()
 
-# =========================
-# Help text (used in error message)
-# =========================
+# ─────────────────────────────────────────────────────────────
+# Help text used when parsing fails
+# ─────────────────────────────────────────────────────────────
 BLOCK_HELP = """Blocks (hourly): 1=00–01, 2=01–02, …, 24=23–24.
 Examples:
 • '3-8' → blocks 3..8
@@ -76,9 +112,9 @@ EXAMPLE_QUERIES = """Examples:
 • "GDAM 12–20 and 2–6 on 12 Sep 2023"
 """
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # Parsing
-# =========================
+# ─────────────────────────────────────────────────────────────
 def parse_market(text: str) -> Optional[str]:
     if re.search(r"\bGDAM\b", text, re.IGNORECASE):
         return "GDAM"
@@ -99,7 +135,7 @@ def _has_month_word(s: str) -> bool:
 
 def parse_date_or_range(text: str) -> Tuple[Optional[date], Optional[date]]:
     """Return (start_date, end_date). If a single date, start==end."""
-    cleaned = re.sub(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b", " ", text)  # strip block ranges
+    cleaned = re.sub(r"\b\d{1,2}\s*[-–]\s*\d{1,2}\b", " ", text)  # remove hour ranges before date parsing
     cleaned = cleaned.strip()
     lower = cleaned.lower()
     today = date.today()
@@ -128,13 +164,16 @@ def parse_date_or_range(text: str) -> Tuple[Optional[date], Optional[date]]:
     if matches:
         for s, dt in matches:
             if dt.year >= Y_MIN:
-                if _has_month_word(s) and not re.search(r"\b([12]\d|3[01]|0?[1-9])\b", s):
+                # Month-only phrase → whole month
+                if _has_month_word(s) and not re.search(r"\b([12]\d|3[01])\b", s):
                     start = date(dt.year, dt.month, 1)
                     end = date(dt.year, dt.month, calendar.monthrange(dt.year, dt.month)[1])
                     return (start, end)
+                # Year-only → whole year
                 if re.fullmatch(r"\s*20\d{2}\s*", s) or "year" in lower or "full year" in lower:
                     y = dt.year
                     return (date(y, 1, 1), date(y, 12, 31))
+                # Single date
                 d = _safe_date(dt)
                 if d:
                     return (d, d)
@@ -178,9 +217,9 @@ def expand_ranges(ranges: List[Tuple[int, int]]) -> List[int]:
             seen.add(b)
     return out
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # DB Fetch & Stats
-# =========================
+# ─────────────────────────────────────────────────────────────
 def fetch_prices_day(market: str, d: date, blocks: List[int]) -> Dict[int, Dict[str, float]]:
     if not blocks:
         return {}
@@ -194,12 +233,14 @@ def fetch_prices_day(market: str, d: date, blocks: List[int]) -> Dict[int, Dict[
         AND tb.block_index = ANY(%s)
       ORDER BY tb.block_index
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute(q, (market, d, blocks))
-        rows = cur.fetchall()
+    # Fresh connection per query → no stale handles after Railway idle/wake
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(q, (market, d, blocks))
+            rows = cur.fetchall()
     return {
         int(r["block_index"]): {
-            "price": float(r["price_rs_per_mwh"]),   # DB likely ₹/MWh; labels below show kWh per request (cosmetic).
+            "price": float(r["price_rs_per_mwh"]),   # DB value; UI labels as kWh (cosmetic)
             "minutes": int(r["duration_min"]),
         }
         for r in rows
@@ -220,15 +261,16 @@ def fetch_prices_range(market: str, start: date, end: date, blocks: List[int]):
       ORDER BY pp.delivery_date, tb.block_index
     """
     out: Dict[date, Dict[int, Dict[str, float]]] = {}
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute(q, (market, start, end, blocks))
-        for r in cur.fetchall():
-            d = r["delivery_date"]
-            out.setdefault(d, {})
-            out[d][int(r["block_index"])] = {
-                "price": float(r["price_rs_per_mwh"]),
-                "minutes": int(r["duration_min"]),
-            }
+    with _connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+            cur.execute(q, (market, start, end, blocks))
+            for r in cur.fetchall():
+                d = r["delivery_date"]
+                out.setdefault(d, {})
+                out[d][int(r["block_index"])] = {
+                    "price": float(r["price_rs_per_mwh"]),
+                    "minutes": int(r["duration_min"]),
+                }
     return out
 
 def _stats_over_items(items: Iterable[Dict[str, float]]):
@@ -262,7 +304,7 @@ def compute_stats_over_range(per_day: Dict[date, Dict[int, Dict[str, float]]], b
                 all_items.append(day_map[b])
     combined = _stats_over_items(all_items)
 
-    # Daily TWAPs (kept for completeness; not rendered as a table right now)
+    # Daily TWAPs (kept for completeness; not rendered while table UI is off)
     daily_rows = []
     for d in sorted(per_day.keys()):
         day_map = per_day[d]
@@ -272,9 +314,9 @@ def compute_stats_over_range(per_day: Dict[date, Dict[int, Dict[str, float]]], b
 
     return combined, daily_rows
 
-# =========================
+# ─────────────────────────────────────────────────────────────
 # Formatting helpers
-# =========================
+# ─────────────────────────────────────────────────────────────
 def fmt_money(v: float) -> str:
     return f"₹{v:.2f}"
 
@@ -310,10 +352,13 @@ def months_between_inclusive(start: date, end: date) -> int:
     return (end.year - start.year) * 12 + (end.month - start.month) + 1
 
 def duration_line(start: date, end: date, blocks: List[int]) -> str:
+    # If not full day, show explicit blocks compactly
     if not is_full_day(blocks):
         return f"Blocks: {blocks_compact_label(blocks)} ({len(blocks)} blocks)"
+    # Full day
     if start == end:
         return "Duration: 0–24 (24 blocks)"
+    # Multi-day/month/year → show months count
     months = months_between_inclusive(start, end)
     return f'Duration: {months} month{"s" if months != 1 else ""}'
 
@@ -323,32 +368,20 @@ def stats_md(label: str, st, blocks: List[int], start: date, end: date) -> str:
     lines = [
         f"### {label}",
         f"- **Rate:** {fmt_money(st['twap'])}/kWh",
+        # Removed Sum line as requested
         f"- **Min–Max:** {fmt_money(st['min'])} – {fmt_money(st['max'])}",
         f"- **{duration_line(start, end, blocks)}**",
     ]
     return "\n".join(lines)
 
-# =========================
-# TABLE SECTION (UI) — DISABLED
-# -------------------------------------------------------------
-# All table rendering, buttons and actions have been commented out
-# so the UI stays minimal. Re-enable later if needed.
-#
-# def per_block_table(...): ...
-# def daily_twap_table(...): ...
-# def monthly_rollup(...): ...
-# def monthly_twap_table(...): ...
-# @cl.action_callback("toggle_table"): ...
-# -------------------------------------------------------------
-
-# =========================
-# Chainlit handler (single-line progress + min 2s; NO tables)
-# =========================
+# ─────────────────────────────────────────────────────────────
+# Main message handler (tables disabled)
+# ─────────────────────────────────────────────────────────────
 @cl.on_message
 async def on_message(msg: cl.Message):
     text = msg.content.strip()
 
-    # Start progress line
+    # Progress line
     progress = await progress_start("💭 Thinking …")
     t0 = time.perf_counter()
 
@@ -378,7 +411,6 @@ async def on_message(msg: cl.Message):
             header = f"## **{market} — {dmy(start)}**"
             summary_md = stats_md("Summary", combined, blocks, start, end)
 
-            # Optional per-range summaries (kept; compact text only)
             per_range_md = []
             if ranges:
                 for lo, hi in ranges:
@@ -386,33 +418,38 @@ async def on_message(msg: cl.Message):
                     r_stats = compute_stats(r_blocks, data)
                     per_range_md.append(stats_md(f"Range {lo}-{hi}", r_stats, r_blocks, start, end))
 
-            # NOTE: Details table intentionally disabled
             final_content = "\n\n".join([header, summary_md, *per_range_md])
 
         else:
             # Multi-day / month / year
             data_by_day = fetch_prices_range(market, start, end, blocks)
-            combined, daily_rows = compute_stats_over_range(data_by_day, blocks)
+            combined, _daily_rows = compute_stats_over_range(data_by_day, blocks)
 
             header = f"## **{market} — {dmy(start)} → {dmy(end)}**"
             parts = [header, stats_md("Summary", combined, blocks, start, end)]
-
-            # NOTE: Daily/Monthly tables intentionally disabled
-            # If you later want a compact hint, uncomment the next line:
-            # parts += ["_Detailed tables are temporarily disabled._"]
-
             final_content = "\n\n".join(parts)
 
+    except Exception:
+        # Log full trace for debugging; show a helpful message to the user
+        traceback.print_exc()
+        try:
+            await progress_hide(progress)
+        except Exception:
+            pass
+        await cl.Message(content="⚠️ Temporary data connection issue. Please try again.").send()
+        return
     finally:
-        # Ensure ≥ 2s elapsed
+        # Ensure ≥ 2s total (for the staged Thinking/Calculating UX)
         elapsed = time.perf_counter() - t0
         if elapsed < 2.0:
             await asyncio.sleep(2.0 - elapsed)
+        # Flash 'Calculated' briefly, then hide the progress line
+        try:
+            await progress_update(progress, "✅ Calculated.")
+            await asyncio.sleep(0.35)
+            await progress_hide(progress)
+        except Exception:
+            pass
 
-        # Flash 'Calculated', then hide
-        await progress_update(progress, "✅ Calculated.")
-        await asyncio.sleep(0.35)
-        await progress_hide(progress)
-
-        # Show the answer
-        await cl.Message(content=final_content or "_No content to display._").send()
+    # Final answer
+    await cl.Message(content=final_content or "_No content to display._").send()
