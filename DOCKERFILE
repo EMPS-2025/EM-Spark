@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 EXPOSE 8000
-CMD ["bash", "-lc", "chainlit run app.py -h 0.0.0.0 -p ${PORT}"]
+CMD ["bash", "-lc", "chainlit run app/app.py -h 0.0.0.0 -p ${PORT}"]
