@@ -1,0 +1,39 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/inputs/*
+!data/inputs/.gitkeep
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.build/
+
+# Virtual env
+.env
+.env.*
+venv/
+.venv/
+env/
+ENV/
+
+# Chainlit local state
+.chainlit/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# IDE/config
+.vscode/
+.idea/
+
+# Data (don’t publish raw data)
+*.xlsx
+*.csv
+/mnt/data/*
+IEX Academy.pdf
+
+# Logs
+*.log
