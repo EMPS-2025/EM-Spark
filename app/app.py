@@ -323,7 +323,6 @@ def stats_md(label: str, st, blocks: List[int], start: date, end: date) -> str:
     lines = [
         f"### {label}",
         f"- **Rate:** {fmt_money(st['twap'])}/kWh",
-        f"- **Sum (1 MW):** {fmt_money(st['sum_1mw'])}",
         f"- **Min–Max:** {fmt_money(st['min'])} – {fmt_money(st['max'])}",
         f"- **{duration_line(start, end, blocks)}**",
     ]
